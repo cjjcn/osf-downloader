@@ -240,6 +240,10 @@ class OSFDownloader:
     # =======================
 
     def _resolve_save_path(self, path: Path, file_path: Optional[str]) -> Path:
+        if (path.exists() and path.is_dir()) or not path.name:
+            filename = Path(file_path).name if file_path else "project.zip"
+            return path / filename
+
         if path.suffix:
             return path
         return path.with_suffix(Path(file_path).suffix if file_path else ".zip")

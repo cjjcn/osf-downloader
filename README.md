@@ -36,18 +36,21 @@ The installed CLI entrypoint is `osf-download`.
 > Replace `<OSF_ID>` with your OSF project or component id (the short code in the OSF URL).
 
 ```bash
-osf-download download <OSF_ID> ./data
+osf-download <OSF_ID> ./data
 ```
 
 Download a single file by path inside OSF storage:
 
 ```bash
-osf-download download <OSF_ID> ./data/myfile.csv path/inside/osf/myfile.csv
+osf-download <OSF_ID> ./data/myfile.csv path/inside/osf/myfile.csv
 ```
 
-- Command shape: `osf-download download PROJECT_ID SAVE_PATH [FILE_PATH]`.
+- Command shape: `osf-download PROJECT_ID SAVE_PATH [FILE_PATH]`.
 - `file_path` is the path inside **osfstorage** (case-sensitive; use `/` separators).
 - `save_path` is treated as an *output file path* if it already has a suffix/extension.
+- If `save_path` points to an existing directory such as `./`, the download is saved inside it:
+    - project download → `project.zip`
+    - file download → uses the OSF file name
 - If `save_path` has **no** suffix/extension, the tool appends one automatically:
     - project download → `.zip`
     - file download → uses the extension from `file_path` (e.g. `.csv`)

@@ -1,13 +1,11 @@
 """Shared test configuration and fixtures"""
 
-from pathlib import Path
 import pytest
 from rich.console import Console
 
 # Test configuration
 PROJECT_ID = "ytpuq"
 FILE_PATH = "rpp_data.csv"
-OUTPUT_DIR = Path("./test_output")
 
 
 @pytest.fixture
@@ -17,10 +15,11 @@ def console():
 
 
 @pytest.fixture
-def output_dir():
-    """Create and provide output directory for test files"""
-    OUTPUT_DIR.mkdir(exist_ok=True)
-    return OUTPUT_DIR
+def output_dir(tmp_path):
+    """Create and provide an isolated output directory for test files"""
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    return output_dir
 
 
 @pytest.fixture

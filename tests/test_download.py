@@ -9,7 +9,7 @@ class TestProjectDownload:
     def test_download_entire_project(self, console, output_dir, project_id):
         """
         Test downloading entire OSF project as ZIP
-        (as described in README: osf-download download <OSF_ID> ./data)
+        (as described in README: osf-download <OSF_ID> ./data)
         """
         downloader = OSFDownloader(console=console, show_progress=True)
 
@@ -23,7 +23,7 @@ class TestProjectDownload:
     def test_download_project_auto_extension(self, console, output_dir, project_id):
         """
         Test downloading project where .zip extension is chosen automatically
-        (as described in README: osf-download download abcd1 ./datasets/osf)
+        (as described in README: osf-download abcd1 ./datasets/osf)
         """
         downloader = OSFDownloader(console=console, show_progress=True)
 
@@ -33,6 +33,17 @@ class TestProjectDownload:
         assert result.exists()
         console.print(f"[green]✓[/green] Successfully downloaded project to: {result}")
 
+    def test_download_project_to_existing_directory(
+        self, console, output_dir, project_id
+    ):
+        downloader = OSFDownloader(console=console, show_progress=True)
+
+        result = downloader.download(project_id, output_dir)
+
+        assert result.exists()
+        assert result.parent == output_dir
+        assert result.name == "project.zip"
+
 
 class TestFileDownload:
     """Test downloading individual files from OSF storage"""
@@ -40,7 +51,7 @@ class TestFileDownload:
     def test_download_single_file(self, console, output_dir, project_id, file_path):
         """
         Test downloading a single file by its path inside OSF storage
-        (as described in README: osf-download download <OSF_ID> ./data/myfile.csv path/inside/osf/myfile.csv)
+        (as described in README: osf-download <OSF_ID> ./data/myfile.csv path/inside/osf/myfile.csv)
         """
         downloader = OSFDownloader(console=console, show_progress=True)
 
@@ -56,7 +67,7 @@ class TestFileDownload:
     ):
         """
         Test downloading a single file into a directory
-        (as described in README: osf-download download abcd1 ./datasets results/data.csv)
+        (as described in README: osf-download abcd1 ./datasets results/data.csv)
         """
         downloader = OSFDownloader(console=console, show_progress=True)
 
@@ -66,7 +77,14 @@ class TestFileDownload:
 
         assert result.exists()
         console.print(f"[green]✓[/green] Successfully downloaded file to: {result}")
+
+    def test_download_single_file_into_existing_directory(
+        self, console, output_dir, project_id, file_path
+    ):
+        downloader = OSFDownloader(console=console, show_progress=True)
+
+        result = downloader.download(project_id, output_dir, file_path)
+
         assert result.exists()
-        console.print(f"[green]✓[/green] Successfully downloaded file to: {result}")
-        assert result.exists()
-        console.print(f"[green]✓[/green] Successfully downloaded file to: {result}")
+        assert result.parent == output_dir
+        assert result.name == file_path.split("/")[-1]
