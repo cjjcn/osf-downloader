@@ -69,6 +69,7 @@ class OSFDownloader:
         node = self._get_json(f"/nodes/{project_id}")
         root_url = self._get_osfstorage_url(node)
 
+        save_path = Path(save_path)
         save_path = self._resolve_save_path(save_path, file_path)
 
         if file_path:
