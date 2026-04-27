@@ -1,5 +1,6 @@
 """Tests for core download functionality"""
 
+from unittest.mock import MagicMock, patch
 from osf_downloader.download import OSFDownloader
 
 
@@ -88,3 +89,99 @@ class TestFileDownload:
         assert result.exists()
         assert result.parent == output_dir
         assert result.name == file_path.split("/")[-1]
+
+
+class TestPaginationSupport:
+    """Test pagination support for large directories"""
+
+    def test_walk_files_with_pagination(self, console):
+        """
+        Test that _walk_files() correctly handles paginated API responses
+        with links.next pagination
+        """
+        # Create mock paginated API responses
+        page1 = {
+            "data": [
+                {
+                    "attributes": {"name": "file1.txt", "kind": "file"},
+                    "links": {"download": "https://example.com/file1.txt"},
+                },
+                {
+                    "attributes": {"name": "file2.txt", "kind": "file"},
+                    "links": {"download": "https://example.com/file2.txt"},
+                },
+            ],
+            "links": {"next": "https://api.example.com/page2"},
+        }
+
+        page2 = {
+            "data": [
+                {
+                    "attributes": {"name": "file3.txt", "kind": "file"},
+                    "links": {"download": "https://example.com/file3.txt"},
+                },
+            ],
+            "links": {},
+        }
+
+        downloader = OSFDownloader(console=console)
+
+        # Mock the _get_json_url method
+        responses = iter([page1, page2])
+
+        def mock_get_json(url):
+            return next(responses)
+
+        with patch.object(downloader, "_get_json_url", side_effect=mock_get_json):
+            files = list(downloader._walk_files("https://api.example.com/page1"))
+
+        # Should have retrieved all files from both pages
+        assert len(files) == 3
+        assert files[0] == ("https://example.com/file1.txt", "file1.txt")
+        assert files[1] == ("https://example.com/file2.txt", "file2.txt")
+        assert files[2] == ("https://example.com/file3.txt", "file3.txt")
+
+    def test_resolve_file_path_with_pagination(self, console):
+        """
+        Test that _resolve_file_path() correctly handles paginated folder listings
+        """
+        # Create mock paginated API responses for a folder listing
+        page1 = {
+            "data": [
+                {
+                    "attributes": {"name": "file1.txt", "kind": "file"},
+                    "links": {"download": "https://example.com/file1.txt"},
+                },
+                {
+                    "attributes": {"name": "file2.txt", "kind": "file"},
+                    "links": {"download": "https://example.com/file2.txt"},
+                },
+            ],
+            "links": {"next": "https://api.example.com/page2"},
+        }
+
+        page2 = {
+            "data": [
+                {
+                    "attributes": {"name": "target_file.csv", "kind": "file"},
+                    "links": {"download": "https://example.com/target_file.csv"},
+                },
+            ],
+            "links": {},
+        }
+
+        downloader = OSFDownloader(console=console)
+
+        # Mock the _get_json_url method
+        responses = iter([page1, page2])
+
+        def mock_get_json(url):
+            return next(responses)
+
+        with patch.object(downloader, "_get_json_url", side_effect=mock_get_json):
+            result = downloader._resolve_file_path(
+                "https://api.example.com/page1", "target_file.csv"
+            )
+
+        # Should have found the file on the second page
+        assert result == "https://example.com/target_file.csv"

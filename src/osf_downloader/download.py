@@ -97,31 +97,41 @@ class OSFDownloader:
         raise OSFNotFoundError("osfstorage provider not found")
 
     def _walk_files(self, url: str, prefix: str = "") -> Iterable[tuple[str, str]]:
-        data = self._get_json_url(url)
+        while url:
+            data = self._get_json_url(url)
 
-        for item in data["data"]:
-            name = item["attributes"]["name"]
-            kind = item["attributes"]["kind"]
+            for item in data["data"]:
+                name = item["attributes"]["name"]
+                kind = item["attributes"]["kind"]
 
-            if kind == "file":
-                yield item["links"]["download"], f"{prefix}{name}"
-            else:
-                next_url = item["relationships"]["files"]["links"]["related"]["href"]
-                yield from self._walk_files(next_url, f"{prefix}{name}/")
+                if kind == "file":
+                    yield item["links"]["download"], f"{prefix}{name}"
+                else:
+                    next_url = item["relationships"]["files"]["links"]["related"]["href"]
+                    yield from self._walk_files(next_url, f"{prefix}{name}/")
+
+            url = data.get("links", {}).get("next")
 
     def _resolve_file_path(self, root_url: str, path: str) -> str:
         current = root_url
         for part in path.split("/"):
-            data = self._get_json_url(current)
-            for item in data["data"]:
-                if item["attributes"]["name"] == part:
-                    if item["attributes"]["kind"] == "folder":
-                        current = item["relationships"]["files"]["links"]["related"][
-                            "href"
-                        ]
-                        break
-                    return item["links"]["download"]
-            else:
+            found = False
+            next_url = current
+            while next_url:
+                data = self._get_json_url(next_url)
+                for item in data["data"]:
+                    if item["attributes"]["name"] == part:
+                        if item["attributes"]["kind"] == "folder":
+                            current = item["relationships"]["files"]["links"]["related"][
+                                "href"
+                            ]
+                            found = True
+                            break
+                        return item["links"]["download"]
+                if found:
+                    break
+                next_url = data.get("links", {}).get("next")
+            if not found:
                 raise OSFNotFoundError(f"Path not found: {part}")
         raise OSFError(f"Path resolves to a folder: {path}")
 
