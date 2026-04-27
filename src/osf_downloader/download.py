@@ -33,8 +33,9 @@ _tqdm_lock = Lock()
 
 class OSFDownloader:
     API_ROOT = "https://api.osf.io/v2"
-    REQUEST_TIMEOUT = 60
-    MAX_RETRIES = 6
+    REQUEST_TIMEOUT = int(os.getenv("OSF_REQUEST_TIMEOUT", "60"))
+    MAX_RETRIES = int(os.getenv("OSF_MAX_RETRIES", "12"))
+    RETRY_MAX_DELAY = float(os.getenv("OSF_RETRY_MAX_DELAY", "60"))
     RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
     _TQDM_COLOURS = [
@@ -290,9 +291,9 @@ class OSFDownloader:
                 if not retryable or attempt == self.MAX_RETRIES - 1:
                     raise OSFRequestError(str(e)) from e
 
-                delay = min(30.0, (2**attempt) + random.uniform(0.0, 1.0))
+                delay = min(self.RETRY_MAX_DELAY, (2**attempt) + random.uniform(0.0, 1.0))
                 self._status(
-                    f"Temporary request error ({status or type(e).__name__}); retrying in {delay:.1f}s"
+                    f"Temporary request error ({status or type(e).__name__}); retrying in {delay:.1f}s (attempt {attempt + 1}/{self.MAX_RETRIES})"
                 )
                 time.sleep(delay)
 
