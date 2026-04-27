@@ -1,7 +1,11 @@
 """Tests for core download functionality"""
 
 from unittest.mock import MagicMock, patch
-from osf_downloader.download import OSFDownloader
+
+import pytest
+import requests
+
+from osf_downloader.download import OSFDownloader, OSFRequestError
 
 
 class TestProjectDownload:
@@ -185,3 +189,41 @@ class TestPaginationSupport:
 
         # Should have found the file on the second page
         assert result == "https://example.com/target_file.csv"
+
+
+class TestRetrySupport:
+    """Test retry behavior for transient request failures"""
+
+    def test_get_json_url_retries_on_502(self, console):
+        downloader = OSFDownloader(console=console)
+
+        retry_response = MagicMock()
+        retry_response.status_code = 502
+
+        success_response = MagicMock()
+        success_response.status_code = 200
+        success_response.raise_for_status.return_value = None
+        success_response.json.return_value = {"data": [], "links": {}}
+
+        with patch.object(
+            downloader.session,
+            "get",
+            side_effect=[retry_response, success_response],
+        ) as mocked_get:
+            with patch("osf_downloader.download.time.sleep"):
+                data = downloader._get_json_url("https://api.example.com/page1")
+
+        assert data == {"data": [], "links": {}}
+        assert mocked_get.call_count == 2
+        retry_response.close.assert_called_once()
+
+    def test_get_json_url_raises_on_non_retryable_status(self, console):
+        downloader = OSFDownloader(console=console)
+
+        not_found_response = MagicMock()
+        not_found_response.status_code = 404
+        not_found_response.raise_for_status.side_effect = requests.HTTPError("404")
+
+        with patch.object(downloader.session, "get", return_value=not_found_response):
+            with pytest.raises(OSFRequestError):
+                downloader._get_json_url("https://api.example.com/missing")

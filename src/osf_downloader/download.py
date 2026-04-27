@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import random
+import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -31,6 +33,9 @@ _tqdm_lock = Lock()
 
 class OSFDownloader:
     API_ROOT = "https://api.osf.io/v2"
+    REQUEST_TIMEOUT = 60
+    MAX_RETRIES = 6
+    RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 
     _TQDM_COLOURS = [
         "green",
@@ -141,8 +146,7 @@ class OSFDownloader:
     # =======================
 
     def _download_single(self, url: str, target: Path) -> None:
-        response = self.session.get(url, stream=True)
-        response.raise_for_status()
+        response = self._request_get(url, stream=True)
 
         os.makedirs(target.parent, exist_ok=True)
 
@@ -213,8 +217,7 @@ class OSFDownloader:
         arcname: str,
         bar: tqdm,
     ) -> tuple[str, bytes]:
-        response = self.session.get(url, stream=True)
-        response.raise_for_status()
+        response = self._request_get(url, stream=True)
 
         total = int(response.headers.get("content-length", 0))
         bar.reset(total=total or None)
@@ -262,13 +265,45 @@ class OSFDownloader:
     def _get_json(self, endpoint: str) -> dict:
         return self._get_json_url(f"{self.API_ROOT}{endpoint}")
 
+    def _request_get(self, url: str, *, stream: bool = False) -> requests.Response:
+        for attempt in range(self.MAX_RETRIES):
+            try:
+                response = self.session.get(
+                    url,
+                    stream=stream,
+                    timeout=self.REQUEST_TIMEOUT,
+                )
+
+                if response.status_code in self.RETRYABLE_STATUS_CODES:
+                    status = response.status_code
+                    error = requests.HTTPError(f"{status} response for {url}")
+                    error.response = response
+                    response.close()
+                    raise error
+
+                response.raise_for_status()
+                return response
+            except requests.RequestException as e:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                retryable = status in self.RETRYABLE_STATUS_CODES or status is None
+
+                if not retryable or attempt == self.MAX_RETRIES - 1:
+                    raise OSFRequestError(str(e)) from e
+
+                delay = min(30.0, (2**attempt) + random.uniform(0.0, 1.0))
+                self._status(
+                    f"Temporary request error ({status or type(e).__name__}); retrying in {delay:.1f}s"
+                )
+                time.sleep(delay)
+
+        raise OSFRequestError(f"Failed request after {self.MAX_RETRIES} attempts: {url}")
+
     def _get_json_url(self, url: str) -> dict:
         try:
-            response = self.session.get(url)
-            response.raise_for_status()
+            response = self._request_get(url)
             return response.json()
-        except requests.RequestException as e:
-            raise OSFRequestError(str(e)) from e
+        except ValueError as e:
+            raise OSFRequestError(f"Invalid JSON response from {url}") from e
 
     def _status(self, message: str) -> None:
         if self.console:
