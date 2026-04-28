@@ -6,10 +6,8 @@ import os
 import random
 import time
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from threading import Lock
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 import requests
 from rich.console import Console
@@ -26,9 +24,6 @@ class OSFRequestError(OSFError):
 
 class OSFNotFoundError(OSFError):
     pass
-
-
-_tqdm_lock = Lock()
 
 
 class OSFDownloader:
@@ -83,8 +78,7 @@ class OSFDownloader:
             self._download_single(url, save_path)
         else:
             self._status("Listing all files in osfstorage")
-            files = list(self._walk_files(root_url))
-            self._download_all_to_zip(files, save_path)
+            self._download_all_to_zip(self._walk_files_with_progress(root_url), save_path)
 
         self._status(f"Saved to {save_path}")
         return save_path
@@ -103,8 +97,15 @@ class OSFDownloader:
 
         raise OSFNotFoundError("osfstorage provider not found")
 
-    def _walk_files(self, url: str, prefix: str = "") -> Iterable[tuple[str, str]]:
+    def _walk_files(
+        self,
+        url: str,
+        prefix: str = "",
+        on_page: Optional[Callable[[], None]] = None,
+    ) -> Iterable[tuple[str, str]]:
         while url:
+            if on_page:
+                on_page()
             data = self._get_json_url(url)
 
             for item in data["data"]:
@@ -115,9 +116,34 @@ class OSFDownloader:
                     yield item["links"]["download"], f"{prefix}{name}"
                 else:
                     next_url = item["relationships"]["files"]["links"]["related"]["href"]
-                    yield from self._walk_files(next_url, f"{prefix}{name}/")
+                    yield from self._walk_files(
+                        next_url,
+                        f"{prefix}{name}/",
+                        on_page=on_page,
+                    )
 
             url = data.get("links", {}).get("next")
+
+    def _walk_files_with_progress(self, root_url: str) -> Iterable[tuple[str, str]]:
+        pages_scanned = 0
+
+        def mark_page_scanned() -> None:
+            nonlocal pages_scanned
+            pages_scanned += 1
+
+        with self._tqdm(
+            total=None,
+            desc="Listing files",
+            unit="file",
+            leave=True,
+            colour=self._TQDM_COLOURS[1],
+        ) as bar:
+            for file_info in self._walk_files(root_url, on_page=mark_page_scanned):
+                bar.update(1)
+                bar.set_postfix_str(f"pages={pages_scanned}")
+                yield file_info
+
+            bar.set_postfix_str(f"pages={pages_scanned}")
 
     def _resolve_file_path(self, root_url: str, path: str) -> str:
         current = root_url
@@ -177,61 +203,31 @@ class OSFDownloader:
 
     def _download_all_to_zip(
         self,
-        files: list[tuple[str, str]],
+        files: Iterable[tuple[str, str]],
         target: Path,
     ) -> None:
         os.makedirs(target.parent, exist_ok=True)
 
-        bars: list[tqdm] = []
-
-        for i, (_, arcname) in enumerate(files):
-            bars.append(
-                self._tqdm(
-                    total=0,
-                    desc=arcname,
-                    position=i,
-                    leave=False,
-                    unit="B",
-                    unit_scale=True,
-                    unit_divisor=1024,
-                    colour=self._TQDM_COLOURS[i % len(self._TQDM_COLOURS)],
-                )
-            )
-
         with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
-            with ThreadPoolExecutor(max_workers=self.max_workers) as pool:
-                futures = [
-                    pool.submit(self._fetch_file_streamed, url, arcname, bar)
-                    for (url, arcname), bar in zip(files, bars)
-                ]
+            for i, (url, arcname) in enumerate(files):
+                with self._request_get(url, stream=True) as response:
+                    total = int(response.headers.get("content-length", 0))
 
-                for future in as_completed(futures):
-                    arcname, data = future.result()
-                    zf.writestr(arcname, data)
-
-        for bar in bars:
-            bar.close()
-
-    def _fetch_file_streamed(
-        self,
-        url: str,
-        arcname: str,
-        bar: tqdm,
-    ) -> tuple[str, bytes]:
-        response = self._request_get(url, stream=True)
-
-        total = int(response.headers.get("content-length", 0))
-        bar.reset(total=total or None)
-
-        chunks: list[bytes] = []
-
-        for chunk in response.iter_content(chunk_size=8192):
-            if chunk:
-                chunks.append(chunk)
-                with _tqdm_lock:
-                    bar.update(len(chunk))
-
-        return arcname, b"".join(chunks)
+                    with self._tqdm(
+                        total=total or None,
+                        desc=arcname,
+                        position=0,
+                        leave=False,
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        colour=self._TQDM_COLOURS[i % len(self._TQDM_COLOURS)],
+                    ) as bar:
+                        with zf.open(arcname, "w") as zf_entry:
+                            for chunk in response.iter_content(chunk_size=8192):
+                                if chunk:
+                                    zf_entry.write(chunk)
+                                    bar.update(len(chunk))
 
     def _tqdm(self, *args: Any, **kwargs: Any) -> tqdm:
         """Create a tqdm progress bar with optional colour.
