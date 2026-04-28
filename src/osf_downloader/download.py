@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import random
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -32,6 +33,7 @@ class OSFDownloader:
     MAX_RETRIES = int(os.getenv("OSF_MAX_RETRIES", "12"))
     RETRY_MAX_DELAY = float(os.getenv("OSF_RETRY_MAX_DELAY", "60"))
     RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+    REFRESHABLE_DOWNLOAD_STATUS_CODES = {400, 401, 403}
 
     _TQDM_COLOURS = [
         "green",
@@ -78,7 +80,11 @@ class OSFDownloader:
             self._download_single(url, save_path)
         else:
             self._status("Listing all files in osfstorage")
-            self._download_all_to_zip(self._walk_files_with_progress(root_url), save_path)
+            self._download_all_to_zip(
+                root_url,
+                self._walk_files_with_progress(root_url),
+                save_path,
+            )
 
         self._status(f"Saved to {save_path}")
         return save_path
@@ -136,6 +142,7 @@ class OSFDownloader:
             desc="Listing files",
             unit="file",
             leave=True,
+            position=0,
             colour=self._TQDM_COLOURS[1],
         ) as bar:
             for file_info in self._walk_files(root_url, on_page=mark_page_scanned):
@@ -203,31 +210,104 @@ class OSFDownloader:
 
     def _download_all_to_zip(
         self,
+        root_url: str,
         files: Iterable[tuple[str, str]],
         target: Path,
     ) -> None:
         os.makedirs(target.parent, exist_ok=True)
 
-        with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as zf:
+        completed = self._existing_archive_members(target)
+        seen_paths = set(completed)
+        skipped_duplicates = 0
+
+        if completed:
+            self._status(f"Resuming archive with {len(completed)} existing files")
+
+        with zipfile.ZipFile(
+            target,
+            "a" if target.exists() else "w",
+            zipfile.ZIP_DEFLATED,
+        ) as zf:
             for i, (url, arcname) in enumerate(files):
-                with self._request_get(url, stream=True) as response:
+                if arcname in completed:
+                    continue
+
+                if arcname in seen_paths:
+                    skipped_duplicates += 1
+                    continue
+
+                self._download_zip_entry(root_url, url, arcname, zf, i)
+                seen_paths.add(arcname)
+
+        if skipped_duplicates:
+            self._status(f"Skipped {skipped_duplicates} duplicate file entries")
+
+    def _download_zip_entry(
+        self,
+        root_url: str,
+        url: str,
+        arcname: str,
+        zf: zipfile.ZipFile,
+        colour_index: int,
+    ) -> None:
+        current_url = url
+
+        for refresh_attempt in range(self.MAX_RETRIES):
+            temp_path: Optional[Path] = None
+            try:
+                fd, temp_name = tempfile.mkstemp(prefix="osf-download-", suffix=".part")
+                os.close(fd)
+                temp_path = Path(temp_name)
+
+                with self._request_get(current_url, stream=True) as response:
                     total = int(response.headers.get("content-length", 0))
 
                     with self._tqdm(
                         total=total or None,
                         desc=arcname,
-                        position=0,
+                        position=1,
                         leave=False,
                         unit="B",
                         unit_scale=True,
                         unit_divisor=1024,
-                        colour=self._TQDM_COLOURS[i % len(self._TQDM_COLOURS)],
+                        colour=self._TQDM_COLOURS[colour_index % len(self._TQDM_COLOURS)],
                     ) as bar:
-                        with zf.open(arcname, "w") as zf_entry:
+                        with open(temp_path, "wb") as temp_file:
                             for chunk in response.iter_content(chunk_size=8192):
                                 if chunk:
-                                    zf_entry.write(chunk)
+                                    temp_file.write(chunk)
                                     bar.update(len(chunk))
+
+                zf.write(temp_path, arcname)
+                return
+            except OSFRequestError as e:
+                status = self._get_error_status_code(e)
+                refreshable = status in self.REFRESHABLE_DOWNLOAD_STATUS_CODES
+                if not refreshable or refresh_attempt == self.MAX_RETRIES - 1:
+                    raise
+
+                self._status(
+                    f"Refreshing expired download URL for {arcname} (attempt {refresh_attempt + 1}/{self.MAX_RETRIES})"
+                )
+                current_url = self._resolve_file_path(root_url, arcname)
+            finally:
+                if temp_path and temp_path.exists():
+                    temp_path.unlink()
+
+    def _existing_archive_members(self, target: Path) -> set[str]:
+        if not target.exists() or target.stat().st_size == 0:
+            return set()
+
+        try:
+            with zipfile.ZipFile(target, "r") as existing_zip:
+                return {info.filename for info in existing_zip.infolist()}
+        except zipfile.BadZipFile:
+            backup_path = target.with_suffix(f"{target.suffix}.corrupt.{int(time.time())}")
+            target.rename(backup_path)
+            self._status(
+                f"Existing archive is not resumable; moved it to {backup_path.name} and starting over"
+            )
+            return set()
 
     def _tqdm(self, *args: Any, **kwargs: Any) -> tqdm:
         """Create a tqdm progress bar with optional colour.
@@ -262,8 +342,13 @@ class OSFDownloader:
     def _get_json(self, endpoint: str) -> dict:
         return self._get_json_url(f"{self.API_ROOT}{endpoint}")
 
+    def _get_error_status_code(self, error: Exception) -> Optional[int]:
+        cause = error.__cause__
+        return getattr(getattr(cause, "response", None), "status_code", None)
+
     def _request_get(self, url: str, *, stream: bool = False) -> requests.Response:
         for attempt in range(self.MAX_RETRIES):
+            response: Optional[requests.Response] = None
             try:
                 response = self.session.get(
                     url,
@@ -281,6 +366,8 @@ class OSFDownloader:
                 response.raise_for_status()
                 return response
             except requests.RequestException as e:
+                if response is not None:
+                    response.close()
                 status = getattr(getattr(e, "response", None), "status_code", None)
                 retryable = status in self.RETRYABLE_STATUS_CODES or status is None
 

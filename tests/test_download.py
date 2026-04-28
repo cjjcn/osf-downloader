@@ -1,5 +1,6 @@
 """Tests for core download functionality"""
 
+import zipfile
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -227,3 +228,84 @@ class TestRetrySupport:
         with patch.object(downloader.session, "get", return_value=not_found_response):
             with pytest.raises(OSFRequestError):
                 downloader._get_json_url("https://api.example.com/missing")
+
+    def test_download_zip_entry_refreshes_expired_url(self, console, output_dir):
+        downloader = OSFDownloader(console=console, show_progress=False)
+
+        expired_error = OSFRequestError("400")
+        http_error = requests.HTTPError("400")
+        http_error.response = MagicMock(status_code=400)
+        expired_error.__cause__ = http_error
+
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.__exit__.return_value = None
+        response.headers = {"content-length": "3"}
+        response.iter_content.return_value = [b"abc"]
+
+        archive = output_dir / "project.zip"
+
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+            with patch.object(
+                downloader,
+                "_request_get",
+                side_effect=[expired_error, response],
+            ):
+                with patch.object(
+                    downloader,
+                    "_resolve_file_path",
+                    return_value="https://example.com/refreshed",
+                ) as resolve_mock:
+                    downloader._download_zip_entry(
+                        "https://api.example.com/root",
+                        "https://example.com/original",
+                        "nested/file.txt",
+                        zf,
+                        0,
+                    )
+
+        with zipfile.ZipFile(archive, "r") as zf:
+            assert zf.read("nested/file.txt") == b"abc"
+
+        resolve_mock.assert_called_once_with(
+            "https://api.example.com/root",
+            "nested/file.txt",
+        )
+
+
+class TestArchiveResume:
+    def test_download_all_to_zip_resumes_existing_archive(self, console, output_dir):
+        downloader = OSFDownloader(console=console, show_progress=False)
+        archive = output_dir / "project.zip"
+
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("done.txt", b"done")
+
+        downloaded = []
+
+        def fake_download(root_url, url, arcname, zf, colour_index):
+            downloaded.append((root_url, url, arcname))
+            zf.writestr(arcname, b"new")
+
+        with patch.object(downloader, "_download_zip_entry", side_effect=fake_download):
+            downloader._download_all_to_zip(
+                "https://api.example.com/root",
+                iter(
+                    [
+                        ("https://example.com/done", "done.txt"),
+                        ("https://example.com/new", "new.txt"),
+                    ]
+                ),
+                archive,
+            )
+
+        with zipfile.ZipFile(archive, "r") as zf:
+            assert sorted(zf.namelist()) == ["done.txt", "new.txt"]
+
+        assert downloaded == [
+            (
+                "https://api.example.com/root",
+                "https://example.com/new",
+                "new.txt",
+            )
+        ]
