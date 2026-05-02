@@ -1,12 +1,13 @@
 """Tests for core download functionality"""
 
+import threading
 import zipfile
 from unittest.mock import MagicMock, patch
 
 import pytest
 import requests
 
-from osf_downloader.download import OSFDownloader, OSFRequestError
+from osf_downloader.download import OSFDownloader, OSFNotFoundError, OSFRequestError
 
 
 class TestProjectDownload:
@@ -229,7 +230,7 @@ class TestRetrySupport:
             with pytest.raises(OSFRequestError):
                 downloader._get_json_url("https://api.example.com/missing")
 
-    def test_download_zip_entry_refreshes_expired_url(self, console, output_dir):
+    def test_fetch_zip_entry_refreshes_expired_url(self, console, output_dir):
         downloader = OSFDownloader(console=console, show_progress=False)
 
         expired_error = OSFRequestError("400")
@@ -243,34 +244,30 @@ class TestRetrySupport:
         response.headers = {"content-length": "3"}
         response.iter_content.return_value = [b"abc"]
 
-        archive = output_dir / "project.zip"
-
-        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+        with patch.object(
+            downloader,
+            "_request_get",
+            side_effect=[expired_error, response],
+        ):
             with patch.object(
                 downloader,
-                "_request_get",
-                side_effect=[expired_error, response],
-            ):
-                with patch.object(
-                    downloader,
-                    "_resolve_file_path",
-                    return_value="https://example.com/refreshed",
-                ) as resolve_mock:
-                    downloader._download_zip_entry(
-                        "https://api.example.com/root",
-                        "https://example.com/original",
-                        "nested/file.txt",
-                        zf,
-                        0,
-                    )
+                "_get_json_url",
+                return_value={"data": {"links": {"download": "https://example.com/refreshed"}}},
+            ) as info_mock:
+                arcname, temp_path = downloader._fetch_zip_entry(
+                    "https://api.example.com/root",
+                    "https://example.com/original",
+                    "nested/file.txt",
+                    "https://api.example.com/files/abc",
+                    0,
+                    str(output_dir),
+                )
 
-        with zipfile.ZipFile(archive, "r") as zf:
-            assert zf.read("nested/file.txt") == b"abc"
+        assert arcname == "nested/file.txt"
+        assert temp_path.read_bytes() == b"abc"
+        temp_path.unlink()
 
-        resolve_mock.assert_called_once_with(
-            "https://api.example.com/root",
-            "nested/file.txt",
-        )
+        info_mock.assert_called_once_with("https://api.example.com/files/abc")
 
 
 class TestArchiveResume:
@@ -283,11 +280,13 @@ class TestArchiveResume:
 
         downloaded = []
 
-        def fake_download(root_url, url, arcname, zf, colour_index):
+        def fake_download(root_url, url, arcname, info_url, colour_index, temp_dir):
             downloaded.append((root_url, url, arcname))
-            zf.writestr(arcname, b"new")
+            temp_path = output_dir / f"{arcname}.part"
+            temp_path.write_bytes(b"new")
+            return arcname, temp_path
 
-        with patch.object(downloader, "_download_zip_entry", side_effect=fake_download):
+        with patch.object(downloader, "_fetch_zip_entry", side_effect=fake_download):
             downloader._download_all_to_zip(
                 "https://api.example.com/root",
                 iter(
@@ -309,3 +308,106 @@ class TestArchiveResume:
                 "new.txt",
             )
         ]
+
+    def test_download_all_to_zip_skips_missing_file(self, console, output_dir):
+        downloader = OSFDownloader(console=console, show_progress=False)
+        archive = output_dir / "project.zip"
+
+        with patch.object(
+            downloader,
+            "_fetch_zip_entry",
+            side_effect=[
+                OSFNotFoundError("Path no longer available"),
+                ("ok.txt", output_dir / "ok.txt.part"),
+            ],
+        ) as download_mock:
+            (output_dir / "ok.txt.part").write_bytes(b"ok")
+            downloader._download_all_to_zip(
+                "https://api.example.com/root",
+                iter(
+                    [
+                        ("https://example.com/missing", "missing.txt"),
+                        ("https://example.com/ok", "ok.txt"),
+                    ]
+                ),
+                archive,
+            )
+
+        assert download_mock.call_count == 2
+
+    def test_download_all_to_zip_uses_resume_state_without_listing(
+        self, console, output_dir
+    ):
+        downloader = OSFDownloader(console=console, show_progress=False)
+        archive = output_dir / "project.zip"
+        state_path = archive.parent / f"{archive.name}.resume.jsonl"
+        state_path.write_text(
+            '{"url": "https://example.com/file1", "arcname": "file1.txt"}\n',
+            encoding="utf-8",
+        )
+
+        with patch.object(downloader, "_write_resume_entries") as write_state_mock:
+            with patch.object(
+                downloader,
+                "_fetch_zip_entry",
+                return_value=("file1.txt", output_dir / "file1.txt.part"),
+            ) as download_mock:
+                (output_dir / "file1.txt.part").write_bytes(b"data")
+                downloader._download_all_to_zip(
+                    "https://api.example.com/root",
+                    iter([]),
+                    archive,
+                )
+
+        write_state_mock.assert_not_called()
+        download_mock.assert_called_once()
+        assert not state_path.exists()
+
+    def test_download_all_to_zip_limits_inflight_work(self, console, output_dir):
+        downloader = OSFDownloader(console=console, show_progress=False, max_workers=2)
+        archive = output_dir / "project.zip"
+
+        active = 0
+        peak = 0
+        active_lock = threading.Lock()
+        second_worker_started = threading.Event()
+        release_workers = threading.Event()
+
+        def fake_download(root_url, url, arcname, info_url, colour_index, temp_dir):
+            nonlocal active, peak
+            with active_lock:
+                active += 1
+                peak = max(peak, active)
+                if active == 2:
+                    second_worker_started.set()
+
+            second_worker_started.wait(timeout=1)
+            release_workers.wait(timeout=1)
+            temp_path = output_dir / f"{arcname}.part"
+            temp_path.write_bytes(arcname.encode())
+            with active_lock:
+                active -= 1
+            return arcname, temp_path
+
+        with patch.object(downloader, "_fetch_zip_entry", side_effect=fake_download):
+            runner = threading.Thread(
+                target=downloader._download_all_to_zip,
+                args=(
+                    "https://api.example.com/root",
+                    iter(
+                        [
+                            ("https://example.com/a", "a.txt"),
+                            ("https://example.com/b", "b.txt"),
+                            ("https://example.com/c", "c.txt"),
+                        ]
+                    ),
+                    archive,
+                ),
+            )
+            runner.start()
+            assert second_worker_started.wait(timeout=1)
+            release_workers.set()
+            runner.join(timeout=1)
+            assert not runner.is_alive()
+
+        assert peak <= 2

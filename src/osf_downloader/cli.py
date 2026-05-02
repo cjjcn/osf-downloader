@@ -17,8 +17,15 @@ def download(
     project_id: str = typer.Argument(..., help="OSF project ID"),
     save_path: Path = typer.Argument(..., help="Local output path"),
     file_path: Optional[str] = typer.Argument(None, help="Path inside OSF storage"),
+    workers: int = typer.Option(
+        8,
+        "--workers",
+        "-j",
+        min=1,
+        help="Number of concurrent file downloads when creating a project ZIP.",
+    ),
 ):
-    downloader = OSFDownloader(console=console)
+    downloader = OSFDownloader(console=console, max_workers=workers)
 
     try:
         downloader.download(project_id, save_path, file_path)
